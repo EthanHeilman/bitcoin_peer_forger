@@ -182,7 +182,7 @@ conf.L3socket = L3RawSocket
 iface = "eth0" #parameter
 target_ip = "127.0.0.1" #parameter
 localhost = False  #parameter
-if target_ip = "127.0.0.1":
+if target_ip == "127.0.0.1":
     localhost = True
     # Normally linux does not accept non-local ip addresses for TCP connections
     #  over the loopback but if you set sudo sysctl -w net.ipv4.conf.eth0.route_localnet=1
