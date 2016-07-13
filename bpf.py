@@ -2,10 +2,10 @@ import random, socket, struct, os, array, random, time, threading
 
 import bitcoin
 from bitcoin.net import CAddress
+from bitcoin.messages import msg_version, msg_verack, msg_addr
 
 from scapy.all import ETH_P_ALL, IP, MTU, send, select, sniff, TCP, UDP, Raw, conf, L3RawSocket, sr1, sendp
 
-from bitcoin.messages import msg_version, msg_verack, msg_addr
 
 class Sniff_And_Respond:
     def __init__(s, iface, target_ip, dport, sport, ips, connections):
